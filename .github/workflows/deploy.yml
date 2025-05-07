@@ -109,62 +109,62 @@ jobs:
           instance_type = "t3.micro"
 
           user_data = base64encode(<<EOT
-#!/bin/bash
-apt update -y
-apt install -y docker.io awscli
-systemctl start docker
-aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
-docker run -d -p 80:80 ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.IMAGE_TAG }}
-EOT
-          )
-          vpc_security_group_ids = [aws_security_group.ec2_sg.id]
-        }
+          #!/bin/bash
+          apt update -y
+          apt install -y docker.io awscli
+          systemctl start docker
+          aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+          docker run -d -p 80:80 ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.IMAGE_TAG }}
+          EOT
+                    )
+                    vpc_security_group_ids = [aws_security_group.ec2_sg.id]
+                  }
 
-        resource "aws_lb" "web_alb" {
-          name               = "react-alb"
-          internal           = false
-          load_balancer_type = "application"
-          security_groups    = [aws_security_group.alb_sg.id]
-          subnets            = $TF_SUBNETS
-        }
+                  resource "aws_lb" "web_alb" {
+                    name               = "react-alb"
+                    internal           = false
+                    load_balancer_type = "application"
+                    security_groups    = [aws_security_group.alb_sg.id]
+                    subnets            = $TF_SUBNETS
+                  }
 
-        resource "aws_lb_target_group" "react_tg" {
-          name     = "react-tg"
-          port     = 80
-          protocol = "HTTP"
-          vpc_id   = "${{ env.vpc_id }}"
-        }
+                  resource "aws_lb_target_group" "react_tg" {
+                    name     = "react-tg"
+                    port     = 80
+                    protocol = "HTTP"
+                    vpc_id   = "${{ env.vpc_id }}"
+                  }
 
-        resource "aws_lb_listener" "http" {
-          load_balancer_arn = aws_lb.web_alb.arn
-          port              = 80
-          protocol          = "HTTP"
+                  resource "aws_lb_listener" "http" {
+                    load_balancer_arn = aws_lb.web_alb.arn
+                    port              = 80
+                    protocol          = "HTTP"
 
-          default_action {
-            type             = "forward"
-            target_group_arn = aws_lb_target_group.react_tg.arn
-          }
-        }
+                    default_action {
+                      type             = "forward"
+                      target_group_arn = aws_lb_target_group.react_tg.arn
+                    }
+                  }
 
-        resource "aws_autoscaling_group" "react_asg" {
-          desired_capacity     = 2
-          max_size             = 4
-          min_size             = 2
-          vpc_zone_identifier  = $TF_SUBNETS
-          target_group_arns    = [aws_lb_target_group.react_tg.arn]
+                  resource "aws_autoscaling_group" "react_asg" {
+                    desired_capacity     = 2
+                    max_size             = 4
+                    min_size             = 2
+                    vpc_zone_identifier  = $TF_SUBNETS
+                    target_group_arns    = [aws_lb_target_group.react_tg.arn]
 
-          launch_template {
-            id      = aws_launch_template.react_template.id
-            version = "$Latest"
-          }
+                    launch_template {
+                      id      = aws_launch_template.react_template.id
+                      version = "$Latest"
+                    }
 
-          tag {
-            key                 = "Name"
-            value               = "ReactAutoScale"
-            propagate_at_launch = true
-          }
-        }
-EOF
+                    tag {
+                      key                 = "Name"
+                      value               = "ReactAutoScale"
+                      propagate_at_launch = true
+                    }
+                  }
+          EOF
 
         terraform init
         terraform fmt
