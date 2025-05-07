@@ -1,0 +1,173 @@
+name: Deploy React App to EC2 via ASG & ALB
+
+on:
+  push:
+    branches: [main]
+
+env:
+  AWS_REGION: us-west-2
+  ECR_REPO: react-web
+  IMAGE_TAG: latest
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Install Docker and AWS CLI
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y docker.io unzip curl jq
+        curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+        unzip awscliv2.zip
+        sudo ./aws/install
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Log in to Amazon ECR
+      run: |
+        aws ecr get-login-password --region ${{ env.AWS_REGION }} | \
+        docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+
+    - name: Inject Supabase environment variables
+      run: |
+        echo "REACT_APP_SUPABASE_URL=${{ secrets.SUPABASE_URL }}" > react-app/.env.production
+        echo "REACT_APP_SUPABASE_ANON_KEY=${{ secrets.SUPABASE_ANON_KEY }}" >> react-app/.env.production
+
+    - name: Build and push Docker image
+      run: |
+        docker build -t $ECR_REPO ./react-app
+        docker tag $ECR_REPO:$IMAGE_TAG ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/$ECR_REPO:$IMAGE_TAG
+        docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/$ECR_REPO:$IMAGE_TAG
+
+    - name: Fetch default VPC and subnet IDs
+      id: network
+      run: |
+        VPC_ID=$(aws ec2 describe-vpcs --filters Name=isDefault,Values=true --query "Vpcs[0].VpcId" --output text)
+        SUBNET_IDS=$(aws ec2 describe-subnets --filters Name=vpc-id,Values=$VPC_ID --query "Subnets[*].SubnetId" --output text)
+        echo "vpc_id=$VPC_ID" >> $GITHUB_ENV
+        echo "subnet_ids=$SUBNET_IDS" >> $GITHUB_ENV
+
+    - name: Set up Terraform
+      uses: hashicorp/setup-terraform@v3
+
+    - name: Generate and apply Terraform infrastructure
+      run: |
+        mkdir tf && cd tf
+        IFS=' ' read -r -a SUBNET_ARRAY <<< "$subnet_ids"
+        TF_SUBNETS=$(printf "\"%s\"," "${SUBNET_ARRAY[@]}")
+        TF_SUBNETS="[${TF_SUBNETS%,}]"
+
+        cat > main.tf <<EOF
+        provider "aws" {
+          region = "${{ env.AWS_REGION }}"
+        }
+
+        resource "aws_security_group" "alb_sg" {
+          name        = "alb-sg"
+          ingress {
+            from_port   = 80
+            to_port     = 80
+            protocol    = "tcp"
+            cidr_blocks = ["0.0.0.0/0"]
+          }
+          egress {
+            from_port   = 0
+            to_port     = 0
+            protocol    = "-1"
+            cidr_blocks = ["0.0.0.0/0"]
+          }
+        }
+
+        resource "aws_security_group" "ec2_sg" {
+          name        = "ec2-sg"
+          ingress {
+            from_port       = 80
+            to_port         = 80
+            protocol        = "tcp"
+            security_groups = [aws_security_group.alb_sg.id]
+          }
+          egress {
+            from_port   = 0
+            to_port     = 0
+            protocol    = "-1"
+            cidr_blocks = ["0.0.0.0/0"]
+          }
+        }
+
+        resource "aws_launch_template" "react_template" {
+          name_prefix   = "react-app-"
+          image_id      = "ami-0fc5d935ebf8bc3bc" # Ubuntu 22.04 LTS in us-west-2
+          instance_type = "t3.micro"
+
+          user_data = base64encode(<<EOT
+#!/bin/bash
+apt update -y
+apt install -y docker.io awscli
+systemctl start docker
+aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+docker run -d -p 80:80 ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPO }}:${{ env.IMAGE_TAG }}
+EOT
+          )
+          vpc_security_group_ids = [aws_security_group.ec2_sg.id]
+        }
+
+        resource "aws_lb" "web_alb" {
+          name               = "react-alb"
+          internal           = false
+          load_balancer_type = "application"
+          security_groups    = [aws_security_group.alb_sg.id]
+          subnets            = $TF_SUBNETS
+        }
+
+        resource "aws_lb_target_group" "react_tg" {
+          name     = "react-tg"
+          port     = 80
+          protocol = "HTTP"
+          vpc_id   = "${{ env.vpc_id }}"
+        }
+
+        resource "aws_lb_listener" "http" {
+          load_balancer_arn = aws_lb.web_alb.arn
+          port              = 80
+          protocol          = "HTTP"
+
+          default_action {
+            type             = "forward"
+            target_group_arn = aws_lb_target_group.react_tg.arn
+          }
+        }
+
+        resource "aws_autoscaling_group" "react_asg" {
+          desired_capacity     = 2
+          max_size             = 4
+          min_size             = 2
+          vpc_zone_identifier  = $TF_SUBNETS
+          target_group_arns    = [aws_lb_target_group.react_tg.arn]
+
+          launch_template {
+            id      = aws_launch_template.react_template.id
+            version = "$Latest"
+          }
+
+          tag {
+            key                 = "Name"
+            value               = "ReactAutoScale"
+            propagate_at_launch = true
+          }
+        }
+EOF
+
+        terraform init
+        terraform fmt
+        terraform validate
+        terraform plan -out=plan.tfplan
+        terraform apply -auto-approve
